@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-ghap v1.1.0 — GitHub Actions Progress Monitor
+ghap v1.2.0 — GitHub Actions Progress Monitor
 https://github.com/sindus/term/tree/main/github-action-progress
 
 Install: curl -fsSL https://raw.githubusercontent.com/sindus/term/main/github-action-progress/install.sh | bash
 """
 
-VERSION  = "1.1.0"
+VERSION  = "1.2.0"
 APP_DIR  = __import__('os').path.expanduser("~/.ghap")
 RAW_BASE = "https://raw.githubusercontent.com/sindus/term/main/github-action-progress"
 
@@ -160,9 +160,10 @@ def reset_token(console: Console) -> None:
         os.remove(TOKEN_FILE)
     console.print("[dim]Previous token cleared.[/dim]")
 
-# ─── Raw keyboard input ───────────────────────────────────────────────────────
+# ─── Keyboard input ──────────────────────────────────────────────────────────
 
 def read_key() -> str:
+    """Blocking raw read — used inside _checkbox_ui."""
     fd  = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
@@ -193,6 +194,46 @@ def read_key() -> str:
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
+
+def _wait_for_key(timeout: float) -> Optional[str]:
+    """
+    Wait up to `timeout` seconds for a keypress during the monitoring loop.
+    Uses cbreak mode (keeps OPOST + ISIG) so Rich Live rendering is unaffected
+    and Ctrl-C still raises KeyboardInterrupt normally.
+    Returns 'esc' or None.
+    """
+    if not sys.stdin.isatty():
+        time.sleep(timeout)
+        return None
+    fd  = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        new        = termios.tcgetattr(fd)
+        new[3]     = new[3] & ~(termios.ECHO | termios.ICANON)  # no echo, immediate chars
+        new[6]     = list(new[6])
+        new[6][termios.VMIN]  = 0
+        new[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+
+        ready, _, _ = _select.select([fd], [], [], timeout)
+        if not ready:
+            return None
+        ch = os.read(fd, 1)
+        if ch == b"\x1b":
+            # Drain any following bytes (arrow keys etc.) then return 'esc'
+            r2, _, _ = _select.select([fd], [], [], 0.05)
+            if r2:
+                ch2 = os.read(fd, 1)
+                if ch2 == b"[":
+                    r3, _, _ = _select.select([fd], [], [], 0.05)
+                    if r3:
+                        os.read(fd, 1)  # consume A/B/C/D
+            return "esc"
+        # Ignore any other key pressed during monitoring
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
 # ─── Interactive checkbox UI ──────────────────────────────────────────────────
 
 _RST    = "\033[0m"
@@ -204,15 +245,32 @@ _YELLOW = "\033[1;33m"
 _WHITE  = "\033[1;37m"
 
 
-def _checkbox_ui(items: List[Tuple[str, str]], title: str) -> List[str]:
+def _checkbox_ui(
+    items: List[Tuple[str, str]],
+    title: str,
+    preselected: Optional[Set[str]] = None,
+) -> List[str]:
+    """
+    Keyboard-driven checkbox selector.
+    items       : list of (display_label, value)
+    preselected : values to mark as checked on entry (used when returning from monitor)
+    Returns     : list of selected values (guaranteed non-empty)
+    """
     if not sys.stdin.isatty():
         raise RuntimeError("Interactive selection requires a real terminal.")
 
-    selected:   Set[str] = set()
+    selected:   Set[str] = set(preselected) if preselected else set()
     cursor      = 0
     page_start  = 0
     filter_text = ""
     page_size   = 0
+
+    # Place cursor on the first preselected item if any
+    if preselected:
+        for i, (_, v) in enumerate(items):
+            if v in preselected:
+                cursor = i
+                break
 
     def filtered() -> List[Tuple[str, str]]:
         if not filter_text:
@@ -413,7 +471,6 @@ class GitHub:
     def get_latest_failed_per_workflow(self, full_name: str) -> List[dict]:
         """
         For each workflow in this repo, return its most recent run if it failed.
-        One result per workflow type at most.
         The API returns runs sorted by created_at desc, so the first occurrence
         of each workflow name is its latest run.
         """
@@ -444,7 +501,6 @@ def fmt_duration(iso: Optional[str]) -> str:
     return f"{s // 3600}h {(s % 3600) // 60}m"
 
 def fmt_run_age(run: dict) -> str:
-    """Time since a completed run finished (uses updated_at), or time running."""
     if run.get("status") == "completed":
         return fmt_duration(run.get("updated_at"))
     return fmt_duration(run.get("run_started_at") or run.get("created_at"))
@@ -460,7 +516,6 @@ class RunTracker:
         self.active:    Dict[int, dict]               = {}
         self.completed: Dict[int, Tuple[dict, float]] = {}
         self.jobs:      Dict[int, List[dict]]         = {}
-        # repo_name → list of runs whose latest execution for that workflow failed
         self.failed:    Dict[str, List[dict]]         = {}
 
     def update(self, gh: GitHub) -> None:
@@ -493,7 +548,6 @@ class RunTracker:
                         self.jobs[rid] = jobs_map[rid]
                 self.failed[repo_name] = failed_runs
 
-        # Detect runs that disappeared from active → mark as completed
         now = mono()
         for rid in list(self.active):
             if rid not in seen:
@@ -504,12 +558,9 @@ class RunTracker:
                 del self.active[rid]
                 self.jobs.pop(rid, None)
 
-        # Expire old completed entries
         cutoff = now - COMPLETED_TTL
         self.completed = {k: v for k, v in self.completed.items() if v[1] > cutoff}
 
-        # Remove from "last failed" any run already shown in active or recently completed
-        # (avoids duplicates; recently completed takes priority for 5 min)
         all_tracked = set(self.completed) | set(self.active)
         for repo_name in self.failed:
             self.failed[repo_name] = [
@@ -585,13 +636,11 @@ def _run_block(run: dict, jobs: Optional[List[dict]], completed_at: Optional[flo
 
 
 def _failed_line(run: dict) -> Text:
-    """Compact one-line render for the 'last failed' section."""
     t      = Text()
     repo   = run.get("repository", {}).get("full_name", "?")
     name   = run.get("name", "?")
     branch = run.get("head_branch", "?")
     ago    = fmt_run_age(run)
-
     t.append(" ✗ ",  style="bold red")
     t.append(repo,    style="cyan bold")
     t.append(f"  {name}", style="white bold")
@@ -645,7 +694,6 @@ def render(
 
     body = Text()
 
-    # ── Section 1: active runs ─────────────────────────────────────────────────
     active_runs = sorted(
         tracker.active.values(),
         key=lambda r: (
@@ -657,7 +705,6 @@ def render(
         body.append_text(_run_block(run, tracker.jobs.get(run["id"]), None))
         body.append("\n\n")
 
-    # ── Section 2: last failed per workflow ────────────────────────────────
     all_failed = [
         run
         for repo_name in sorted(tracker.failed)
@@ -670,7 +717,6 @@ def render(
             body.append("\n")
         body.append("\n")
 
-    # ── Section 3: recently completed (transitions seen during this session) ──
     completed_sorted = sorted(
         tracker.completed.items(), key=lambda kv: kv[1][1], reverse=True
     )
@@ -680,7 +726,6 @@ def render(
             body.append_text(_run_block(run, None, ts))
             body.append("\n")
 
-    # ── Empty state ─────────────────────────────────────────────────────────
     if not active_runs and not all_failed and not completed_sorted:
         body.append(
             f"\n  No active or failed workflows on: {', '.join(tracker.repos)}\n\n"
@@ -692,8 +737,8 @@ def render(
     footer = Text(
         f"  {len(active_runs)} active  ·  "
         + (f"{n_failed} last failed  ·  " if n_failed else "")
-        + f"{len(completed_sorted)} recently finished (shown 5 min)  ·  "
-        "Ctrl-C to quit  ·  ghap --reset-token to change your token",
+        + f"{len(completed_sorted)} recently finished  ·  "
+        "[ESC] change repos  ·  [Ctrl-C] quit",
         style="dim",
     )
     return Panel(body, title=title, subtitle=footer, border_style="blue", padding=(0, 1))
@@ -754,38 +799,57 @@ def main() -> None:
         )
         for r in repos
     ]
-    selected = _checkbox_ui(items, title="Select repositories to monitor")
 
-    console.print(f"[green]Watching {len(selected)} repo(s):[/green]")
-    for name in selected:
-        console.print(f"  [cyan]•[/cyan] {name}")
-    console.print(f"\n[dim]Refreshing every {args.interval}s — Ctrl-C to quit[/dim]\n")
-    time.sleep(0.6)
+    preselected: Optional[Set[str]] = None
 
-    tracker      = RunTracker(selected)
-    last_refresh: float = 0.0
-    loading      = True
+    while True:  # selection ↔ monitoring loop
+        selected = _checkbox_ui(
+            items,
+            title="Select repositories to monitor",
+            preselected=preselected,
+        )
 
-    with Live(console=console, refresh_per_second=4, screen=True) as live:
-        while True:
-            now     = mono()
-            elapsed = now - last_refresh
-            next_in = max(0, int(args.interval - elapsed))
+        console.print(f"[green]Watching {len(selected)} repo(s):[/green]")
+        for name in selected:
+            console.print(f"  [cyan]•[/cyan] {name}")
+        console.print(f"\n[dim]Refreshing every {args.interval}s — ESC to change repos — Ctrl-C to quit[/dim]\n")
+        time.sleep(0.5)
 
-            if elapsed >= args.interval or last_refresh == 0:
-                loading = True
-                live.update(render(gh, tracker, args.interval, 0, loading, username))
-                try:
-                    tracker.update(gh)
-                except RuntimeError as exc:
-                    console.print(f"[red]{exc}[/red]")
-                    sys.exit(1)
-                last_refresh = mono()
-                next_in  = args.interval
-                loading  = False
+        tracker      = RunTracker(selected)
+        last_refresh: float = 0.0
+        loading      = True
+        go_back      = False
 
-            live.update(render(gh, tracker, args.interval, next_in, loading, username))
-            time.sleep(0.25)
+        with Live(console=console, refresh_per_second=4, screen=True) as live:
+            while True:
+                now     = mono()
+                elapsed = now - last_refresh
+                next_in = max(0, int(args.interval - elapsed))
+
+                if elapsed >= args.interval or last_refresh == 0:
+                    loading = True
+                    live.update(render(gh, tracker, args.interval, 0, loading, username))
+                    try:
+                        tracker.update(gh)
+                    except RuntimeError as exc:
+                        console.print(f"[red]{exc}[/red]")
+                        sys.exit(1)
+                    last_refresh = mono()
+                    next_in  = args.interval
+                    loading  = False
+
+                live.update(render(gh, tracker, args.interval, next_in, loading, username))
+
+                key = _wait_for_key(0.25)
+                if key == "esc":
+                    go_back = True
+                    break
+
+        if not go_back:
+            break
+
+        # Remember current selection so the checkbox pre-ticks them on return
+        preselected = set(selected)
 
 
 if __name__ == "__main__":
