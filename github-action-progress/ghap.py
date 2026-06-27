@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-ghap v1.0.0 — GitHub Actions Progress Monitor
+ghap v1.1.0 — GitHub Actions Progress Monitor
 https://github.com/sindus/term/tree/main/github-action-progress
 
 Install: curl -fsSL https://raw.githubusercontent.com/sindus/term/main/github-action-progress/install.sh | bash
 """
 
-VERSION  = "1.0.0"
+VERSION  = "1.1.0"
 APP_DIR  = __import__('os').path.expanduser("~/.ghap")
 RAW_BASE = "https://raw.githubusercontent.com/sindus/term/main/github-action-progress"
 
@@ -39,8 +39,8 @@ except ImportError:
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-INTERVAL      = 15     # seconds between refreshes
-COMPLETED_TTL = 300    # keep completed runs visible for 5 min
+INTERVAL      = 15
+COMPLETED_TTL = 300
 CONFIG_DIR    = os.path.expanduser("~/.config/ghap")
 TOKEN_FILE    = os.path.join(CONFIG_DIR, "token")
 API_BASE      = "https://api.github.com"
@@ -71,7 +71,6 @@ def _ver_tuple(v: str) -> tuple:
         return (0,)
 
 def check_update(console: Console) -> None:
-    """Silently check for a newer version. Only prints if an update is found."""
     try:
         r = requests.get(f"{RAW_BASE}/version.txt", timeout=4)
         if not r.ok:
@@ -90,7 +89,7 @@ def check_update(console: Console) -> None:
         if ans in ("", "y", "yes"):
             _do_update(console, latest)
     except Exception:
-        pass  # never block startup on network issues
+        pass
 
 def _do_update(console: Console, latest: str) -> None:
     url      = f"{RAW_BASE}/ghap.py"
@@ -104,7 +103,7 @@ def _do_update(console: Console, latest: str) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(r.text)
         os.chmod(tmp, 0o755)
-        os.replace(tmp, app_path)   # atomic on POSIX
+        os.replace(tmp, app_path)
         console.print(f"[green]✓[/green]  ghap {latest} ready — restarting…\n")
         time.sleep(0.6)
         os.execv(sys.executable, [sys.executable, app_path] + sys.argv[1:])
@@ -160,7 +159,6 @@ def reset_token(console: Console) -> None:
     if os.path.exists(TOKEN_FILE):
         os.remove(TOKEN_FILE)
     console.print("[dim]Previous token cleared.[/dim]")
-    # Will re-prompt on next load_token() call
 
 # ─── Raw keyboard input ───────────────────────────────────────────────────────
 
@@ -207,19 +205,14 @@ _WHITE  = "\033[1;37m"
 
 
 def _checkbox_ui(items: List[Tuple[str, str]], title: str) -> List[str]:
-    """
-    Keyboard-driven checkbox selector.
-    items  : list of (display_label, value)
-    Returns: list of selected values (guaranteed non-empty)
-    """
     if not sys.stdin.isatty():
         raise RuntimeError("Interactive selection requires a real terminal.")
 
-    selected:    Set[str] = set()
-    cursor       = 0
-    page_start   = 0
-    filter_text  = ""
-    page_size    = 0
+    selected:   Set[str] = set()
+    cursor      = 0
+    page_start  = 0
+    filter_text = ""
+    page_size   = 0
 
     def filtered() -> List[Tuple[str, str]]:
         if not filter_text:
@@ -239,9 +232,7 @@ def _checkbox_ui(items: List[Tuple[str, str]], title: str) -> List[str]:
     def render() -> None:
         nonlocal page_size, cursor, page_start
         cols, rows = shutil.get_terminal_size()
-        # reserve: title(1) blank(1) help(1) blank(1) filter(1) blank(1)
-        #          scroll-up(1) scroll-down(1) status(1) blank(1) = 10
-        page_size = max(3, rows - 10)
+        page_size  = max(3, rows - 10)
 
         vis = filtered()
         if vis:
@@ -419,6 +410,28 @@ class GitHub:
     def get_run(self, full_name: str, run_id: int) -> Optional[dict]:
         return self._get(f"/repos/{full_name}/actions/runs/{run_id}")
 
+    def get_latest_failed_per_workflow(self, full_name: str) -> List[dict]:
+        """
+        For each workflow in this repo, return its most recent run if it failed.
+        One result per workflow type at most.
+        The API returns runs sorted by created_at desc, so the first occurrence
+        of each workflow name is its latest run.
+        """
+        data = self._get(f"/repos/{full_name}/actions/runs", per_page=50)
+        if not data:
+            return []
+        runs = data.get("workflow_runs", [])
+        seen_workflows: Set[str] = set()
+        failed: List[dict] = []
+        for run in runs:
+            wname = run.get("name", "")
+            if wname in seen_workflows:
+                continue
+            seen_workflows.add(wname)
+            if run.get("status") == "completed" and run.get("conclusion") == "failure":
+                failed.append(run)
+        return failed
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def fmt_duration(iso: Optional[str]) -> str:
@@ -429,6 +442,12 @@ def fmt_duration(iso: Optional[str]) -> str:
     if s < 60:   return f"{s}s"
     if s < 3600: return f"{s // 60}m {s % 60:02d}s"
     return f"{s // 3600}h {(s % 3600) // 60}m"
+
+def fmt_run_age(run: dict) -> str:
+    """Time since a completed run finished (uses updated_at), or time running."""
+    if run.get("status") == "completed":
+        return fmt_duration(run.get("updated_at"))
+    return fmt_duration(run.get("run_started_at") or run.get("created_at"))
 
 def mono() -> float:
     return time.monotonic()
@@ -441,11 +460,13 @@ class RunTracker:
         self.active:    Dict[int, dict]               = {}
         self.completed: Dict[int, Tuple[dict, float]] = {}
         self.jobs:      Dict[int, List[dict]]         = {}
+        # repo_name → list of runs whose latest execution for that workflow failed
+        self.failed:    Dict[str, List[dict]]         = {}
 
     def update(self, gh: GitHub) -> None:
         seen: Set[int] = set()
 
-        def fetch(repo: str) -> Tuple[List[dict], Dict[int, List[dict]]]:
+        def fetch(repo: str) -> Tuple[List[dict], Dict[int, List[dict]], List[dict]]:
             runs     = gh.get_active_runs(repo)
             jobs_map: Dict[int, List[dict]] = {}
             for run in runs:
@@ -453,13 +474,15 @@ class RunTracker:
                     jobs = gh.get_jobs(repo, run["id"])
                     if jobs:
                         jobs_map[run["id"]] = jobs
-            return runs, jobs_map
+            failed = gh.get_latest_failed_per_workflow(repo)
+            return runs, jobs_map, failed
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = {pool.submit(fetch, r): r for r in self.repos}
             for fut in as_completed(futures):
+                repo_name = futures[fut]
                 try:
-                    runs, jobs_map = fut.result()
+                    runs, jobs_map, failed_runs = fut.result()
                 except Exception:
                     continue
                 for run in runs:
@@ -468,7 +491,9 @@ class RunTracker:
                     self.active[rid] = run
                     if rid in jobs_map:
                         self.jobs[rid] = jobs_map[rid]
+                self.failed[repo_name] = failed_runs
 
+        # Detect runs that disappeared from active → mark as completed
         now = mono()
         for rid in list(self.active):
             if rid not in seen:
@@ -479,8 +504,18 @@ class RunTracker:
                 del self.active[rid]
                 self.jobs.pop(rid, None)
 
+        # Expire old completed entries
         cutoff = now - COMPLETED_TTL
         self.completed = {k: v for k, v in self.completed.items() if v[1] > cutoff}
+
+        # Remove from "last failed" any run already shown in active or recently completed
+        # (avoids duplicates; recently completed takes priority for 5 min)
+        all_tracked = set(self.completed) | set(self.active)
+        for repo_name in self.failed:
+            self.failed[repo_name] = [
+                f for f in self.failed[repo_name]
+                if f["id"] not in all_tracked
+            ]
 
 # ─── Rendering ────────────────────────────────────────────────────────────────
 
@@ -507,7 +542,7 @@ def _run_block(run: dict, jobs: Optional[List[dict]], completed_at: Optional[flo
     t.append(f"  ·  {age}", style="dim")
 
     if status == "completed" and conclusion:
-        lbl   = conclusion.upper().replace("_", " ")
+        lbl    = conclusion.upper().replace("_", " ")
         i2, c2 = CONCLUSION_STYLE.get(conclusion, ("?", "white"))
         t.append(f"  [{i2} {lbl}]", style=c2)
         if completed_at is not None:
@@ -549,6 +584,33 @@ def _run_block(run: dict, jobs: Optional[List[dict]], completed_at: Optional[flo
     return t
 
 
+def _failed_line(run: dict) -> Text:
+    """Compact one-line render for the 'last failed' section."""
+    t      = Text()
+    repo   = run.get("repository", {}).get("full_name", "?")
+    name   = run.get("name", "?")
+    branch = run.get("head_branch", "?")
+    ago    = fmt_run_age(run)
+
+    t.append(" ✗ ",  style="bold red")
+    t.append(repo,    style="cyan bold")
+    t.append(f"  {name}", style="white bold")
+    t.append("  ·  branch: ", style="dim")
+    t.append(branch,  style="magenta")
+    t.append("  ·  failed ", style="dim")
+    t.append(f"{ago} ago", style="red")
+    return t
+
+
+def _section(label: str, color: str = "dim") -> Text:
+    bar = "─" * 3
+    return Text.assemble(
+        (f" {bar} ", color),
+        (label, f"bold {color}"),
+        (f" {bar}\n", color),
+    )
+
+
 def render(
     gh:       GitHub,
     tracker:  RunTracker,
@@ -583,6 +645,7 @@ def render(
 
     body = Text()
 
+    # ── Section 1: active runs ─────────────────────────────────────────────────
     active_runs = sorted(
         tracker.active.values(),
         key=lambda r: (
@@ -594,25 +657,43 @@ def render(
         body.append_text(_run_block(run, tracker.jobs.get(run["id"]), None))
         body.append("\n\n")
 
-    completed_sorted = sorted(tracker.completed.items(), key=lambda kv: kv[1][1], reverse=True)
+    # ── Section 2: last failed per workflow ────────────────────────────────
+    all_failed = [
+        run
+        for repo_name in sorted(tracker.failed)
+        for run in tracker.failed[repo_name]
+    ]
+    if all_failed:
+        body.append_text(_section("last failed", "red"))
+        for run in all_failed:
+            body.append_text(_failed_line(run))
+            body.append("\n")
+        body.append("\n")
+
+    # ── Section 3: recently completed (transitions seen during this session) ──
+    completed_sorted = sorted(
+        tracker.completed.items(), key=lambda kv: kv[1][1], reverse=True
+    )
     if completed_sorted:
-        if active_runs:
-            body.append("─" * 60 + "\n", style="dim")
+        body.append_text(_section("recently completed"))
         for rid, (run, ts) in completed_sorted:
             body.append_text(_run_block(run, None, ts))
             body.append("\n")
 
-    if not active_runs and not completed_sorted:
+    # ── Empty state ─────────────────────────────────────────────────────────
+    if not active_runs and not all_failed and not completed_sorted:
         body.append(
-            f"\n  No active workflows on: {', '.join(tracker.repos)}\n\n"
+            f"\n  No active or failed workflows on: {', '.join(tracker.repos)}\n\n"
             "  Waiting for a push to trigger one…\n",
             style="dim italic",
         )
 
+    n_failed = len(all_failed)
     footer = Text(
         f"  {len(active_runs)} active  ·  "
-        f"{len(completed_sorted)} recently finished (shown for 5 min)  ·  "
-        "Ctrl-C to quit  ·  ghap --reset-token to change your GitHub token",
+        + (f"{n_failed} last failed  ·  " if n_failed else "")
+        + f"{len(completed_sorted)} recently finished (shown 5 min)  ·  "
+        "Ctrl-C to quit  ·  ghap --reset-token to change your token",
         style="dim",
     )
     return Panel(body, title=title, subtitle=footer, border_style="blue", padding=(0, 1))
@@ -641,10 +722,8 @@ def main() -> None:
         "—  GitHub Actions Progress Monitor"
     )
 
-    # Update check (silent if up to date)
     check_update(console)
 
-    # Token
     if args.reset_token:
         reset_token(console)
 
